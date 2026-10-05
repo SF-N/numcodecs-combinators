@@ -24,6 +24,15 @@ from ._chunked import ChunkedNdArray
 from .abc import CodecCombinatorMixin
 
 
+def _is_mask_aware(codec: Codec) -> bool:
+    """Check for the mask-aware codec protocol of
+    [`numcodecs-mask`](https://numcodecs-mask.readthedocs.io) structurally, so
+    that `numcodecs-combinators` does not need to depend on it."""
+    return callable(getattr(codec, "encode_masked", None)) and callable(
+        getattr(codec, "decode_masked", None)
+    )
+
+
 class CodecStack(Codec, CodecCombinatorMixin, tuple[Codec]):
     """
     A stack of codecs, which makes up a combined codec.
@@ -134,6 +143,94 @@ class CodecStack(Codec, CodecCombinatorMixin, tuple[Codec]):
                 numcodecs.compat.ensure_contiguous_ndarray_like(decoded, flatten=False),
                 out=None,
             )
+        return numcodecs.compat.ndarray_copy(decoded, out)  # type: ignore
+
+    def encode_masked(
+        self, buf: Buffer, mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+    ) -> Buffer:
+        """Encode the data in `buf`, ignoring the values where `mask` is
+        [`True`][True].
+
+        The stack forwards the mask to every codec in the stack that
+        implements the mask-aware codec protocol of
+        [`numcodecs-mask`](https://numcodecs-mask.readthedocs.io), i.e. that
+        provides `encode_masked` and `decode_masked` methods; all other codecs
+        encode as usual. All mask-aware codecs in the stack must encode data
+        of the same shape as the mask, e.g. shape-preserving filters may
+        precede them but reshaping codecs must not.
+
+        Parameters
+        ----------
+        buf : Buffer
+            Data to be encoded. May be any object supporting the new-style
+            buffer protocol. The values at masked positions are unspecified.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the data, of
+            the values that do not need to be preserved.
+
+        Returns
+        -------
+        enc : Buffer
+            Encoded data. May be any object supporting the new-style buffer
+            protocol.
+        """
+
+        if len(self) == 0:
+            return buf
+
+        encoded = buf
+        for codec in self:
+            encoded_ndarray = np.asarray(
+                numcodecs.compat.ensure_contiguous_ndarray_like(encoded, flatten=False)
+            )
+            if _is_mask_aware(codec):
+                encoded = codec.encode_masked(encoded_ndarray, mask)  # type: ignore
+            else:
+                encoded = codec.encode(encoded_ndarray)
+        return encoded
+
+    def decode_masked(
+        self,
+        buf: Buffer,
+        mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+        out: Optional[Buffer] = None,
+    ) -> Buffer:
+        """Decode the data in `buf`, which was encoded with the same `mask`.
+
+        The mask is forwarded to every codec in the stack that implements the
+        mask-aware codec protocol of
+        [`numcodecs-mask`](https://numcodecs-mask.readthedocs.io), matching
+        [`encode_masked`][numcodecs_combinators.stack.CodecStack.encode_masked].
+
+        Parameters
+        ----------
+        buf : Buffer
+            Encoded data. May be any object supporting the new-style buffer
+            protocol.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the decoded
+            data, that was passed to
+            [`encode_masked`][numcodecs_combinators.stack.CodecStack.encode_masked].
+        out : Buffer, optional
+            Writeable buffer to store decoded data. N.B. if provided, this
+            buffer must be exactly the right size to store the decoded data.
+
+        Returns
+        -------
+        dec : Buffer
+            Decoded data. May be any object supporting the new-style buffer
+            protocol. The values at masked positions are unspecified.
+        """
+
+        decoded = buf
+        for codec in reversed(self):
+            decoded_ndarray = numcodecs.compat.ensure_contiguous_ndarray_like(
+                decoded, flatten=False
+            )
+            if _is_mask_aware(codec):
+                decoded = codec.decode_masked(decoded_ndarray, mask, out=None)  # type: ignore
+            else:
+                decoded = codec.decode(decoded_ndarray, out=None)
         return numcodecs.compat.ndarray_copy(decoded, out)  # type: ignore
 
     def encode_decode(self, buf: Buffer) -> Buffer:
